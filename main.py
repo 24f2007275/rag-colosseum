@@ -405,9 +405,8 @@ def query_endpoint(request: QueryRequest):
         }
 
     candidate_passages = [
-        knowledge_base[item["index"]]
-        for item in results
-    ]
+    knowledge_base[best["index"]]
+]
 
     if not has_numeric_evidence(question, candidate_passages):
 
