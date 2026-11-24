@@ -223,17 +223,19 @@ def home():
 # MAIN QUERY ENDPOINT
 # -------------------------------
 
+
 @app.post("/query")
 def query_endpoint(request: QueryRequest):
 
-    question = request.question.strip()
+    original_question = request.question.strip()
+    question = sanitize_question(original_question)
 
-    if not question:
+    if not question or not tokenize(question):
         return {
             "answer": None,
             "sources": [],
             "scores": [],
-            "confidence": 0.0
+            "confidence": 0.2
         }
 
     top_k = max(1, min(request.top_k, 10))
@@ -245,12 +247,11 @@ def query_endpoint(request: QueryRequest):
             "answer": None,
             "sources": [],
             "scores": [],
-            "confidence": 0.1
+            "confidence": 0.2
         }
 
     best = results[0]
 
-    # Conservative abstention
     if best["coverage"] < 0.40 or best["raw_score"] < 0.50:
         return {
             "answer": None,
@@ -259,23 +260,28 @@ def query_endpoint(request: QueryRequest):
             "confidence": 0.2
         }
 
-    answer = extract_answer(
-        question,
-        best["index"]
-    )
+    candidate_passages = [
+        knowledge_base[item["index"]]
+        for item in results
+    ]
+
+    if not has_numeric_evidence(question, candidate_passages):
+        return {
+            "answer": None,
+            "sources": [],
+            "scores": [],
+            "confidence": 0.2
+        }
+
+    answer = extract_answer(question, best["index"])
 
     relevant = [
         item for item in results
         if item["score"] >= 0.10
     ]
 
-    sources = [
-        item["index"] for item in relevant
-    ]
-
-    scores = [
-        round(item["score"], 4) for item in relevant
-    ]
+    sources = [item["index"] for item in relevant]
+    scores = [round(item["score"], 4) for item in relevant]
 
     confidence = min(
         0.95,
@@ -290,3 +296,61 @@ def query_endpoint(request: QueryRequest):
         "scores": scores,
         "confidence": round(confidence, 4)
     }
+
+def sanitize_question(question):
+    # Remove malicious instruction clauses but retain valid questions.
+    question = re.sub(
+        r'(?i)\b(ignore|disregard|forget)\b[^.!?]*[.!?]',
+        ' ',
+        question
+    )
+
+    question = re.sub(
+        r'(?i)\b(reveal|show|print|dump|disclose)\b'
+        r'[^.!?]*?(?=\s+\band then\b|\s+\bthen\b|[.!?]|$)',
+        ' ',
+        question
+    )
+
+    question = re.sub(r'(?i)\b(and then|then)\b', ' ', question)
+    return re.sub(r'\s+', ' ', question).strip()
+
+
+def has_numeric_evidence(question, passages):
+    numeric_intent = re.search(
+        r'\b(exact|how many|how much|milliseconds|millisecond|'
+        r'seconds|minutes|numeric value|what number|'
+        r'configured value|in ms)\b',
+        question.lower()
+    )
+
+    if not numeric_intent:
+        return True
+
+    anchors = re.findall(
+        r'\b[a-z]*(?:timeout|duration|latency|interval|'
+        r'port|quorum|batch|window|threshold)\b',
+        question.lower()
+    )
+
+    if not anchors:
+        return True
+
+    for passage in passages:
+        sentences = re.split(r'(?<=[.!?])\s+', passage)
+
+        for sentence in sentences:
+            words = re.findall(r'[a-z0-9]+', sentence.lower())
+
+            for anchor in anchors:
+                for i, word in enumerate(words):
+                    if word.rstrip('s') == anchor.rstrip('s'):
+                        start = max(0, i - 4)
+                        end = min(len(words), i + 5)
+
+                        nearby = words[start:end]
+
+                        if any(re.search(r'\d', w) for w in nearby):
+                            return True
+
+    return False
