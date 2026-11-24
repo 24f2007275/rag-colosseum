@@ -35,6 +35,23 @@ STOPWORDS = {
     "tell", "me", "about", "explain", "describe"
 }
 
+SYNONYMS = {
+    "leader": ["raft", "election"],
+    "elections": ["election"],
+    "consensus": ["raft", "paxos"],
+    "durability": ["wal", "logging"],
+    "authentication": ["jwt", "pkce"],
+    "authorization": ["jwt"],
+    "encryption": ["aes", "chacha20"],
+    "transport": ["tcp", "quic"],
+    "database": ["postgresql", "mysql"],
+    "normalization": ["batchnorm", "layernorm"],
+    "optimization": ["adamw", "sgd"],
+    "password": ["argon2", "pbkdf2"],
+    "routing": ["bgp", "ospf"],
+    "paging": ["shadow", "paging"],
+}
+
 
 # -------------------------------
 # LOAD KNOWLEDGE BASE
@@ -49,9 +66,23 @@ if not isinstance(knowledge_base, list) or len(knowledge_base) != 50:
 documents = [text.lower() for text in knowledge_base]
 
 
+# -------------------------------
+# TOKENIZATION
+# -------------------------------
+
 def tokenize(text):
     words = re.findall(r"[a-z0-9]+", text.lower())
     return [word for word in words if word not in STOPWORDS]
+
+
+def expand_query(question):
+    words = tokenize(question)
+    expanded = list(words)
+
+    for word in words:
+        expanded.extend(SYNONYMS.get(word, []))
+
+    return expanded
 
 
 tokenized_docs = [tokenize(doc) for doc in documents]
@@ -75,7 +106,7 @@ idf = {
 
 
 # -------------------------------
-# BM25 RETRIEVAL
+# BM25 SCORING
 # -------------------------------
 
 def bm25_score(query_words, doc_words, doc_length):
@@ -108,11 +139,16 @@ def bm25_score(query_words, doc_words, doc_length):
     return score
 
 
+# -------------------------------
+# RETRIEVAL
+# -------------------------------
+
 def retrieve(question, top_k=3):
 
-    query_words = tokenize(question)
+    original_words = tokenize(question)
+    query_words = expand_query(question)
 
-    if not query_words:
+    if not original_words:
         return []
 
     results = []
@@ -125,20 +161,36 @@ def retrieve(question, top_k=3):
             doc_lengths[i]
         )
 
-        present = set(query_words) & set(doc_words)
+        doc_set = set(doc_words)
+        original_set = set(original_words)
 
         total_weight = sum(
-            idf.get(word, 0) for word in set(query_words)
+            idf.get(w, 0) for w in original_set
         )
 
         matched_weight = sum(
-            idf.get(word, 0) for word in present
+            idf.get(w, 0)
+            for w in original_set & doc_set
         )
 
         coverage = (
             matched_weight / total_weight
-            if total_weight > 0 else 0
+            if total_weight else 0
         )
+
+        # Phrase matching bonus
+        phrase_bonus = 0
+
+        for j in range(len(original_words) - 1):
+
+            phrase = original_words[j:j + 2]
+
+            for k in range(len(doc_words) - 1):
+
+                if doc_words[k:k + 2] == phrase:
+                    phrase_bonus += 0.5
+
+        raw_score += phrase_bonus
 
         normalized_score = 1 - math.exp(-raw_score / 2.5)
 
@@ -158,7 +210,7 @@ def retrieve(question, top_k=3):
 
 
 # -------------------------------
-# QUESTION CLEANING
+# QUESTION SANITIZATION
 # -------------------------------
 
 def sanitize_question(question):
@@ -186,7 +238,7 @@ def sanitize_question(question):
 
 
 # -------------------------------
-# ABSTENTION CHECK
+# NUMERIC EVIDENCE CHECK
 # -------------------------------
 
 def has_numeric_evidence(question, passages):
@@ -233,46 +285,56 @@ def has_numeric_evidence(question, passages):
 
                     nearby = words[start:end]
 
-                    if any(
-                        re.search(r'\d', w)
-                        for w in nearby
-                    ):
+                    if any(re.search(r'\d', w) for w in nearby):
                         return True
 
     return False
 
 
 # -------------------------------
-# EXTRACT ANSWER
+# ANSWER EXTRACTION
 # -------------------------------
 
-def extract_answer(question, passage_index):
-
-    passage = knowledge_base[passage_index]
-
-    sentences = re.split(r"(?<=[.!?])\s+", passage)
+def extract_answer(question, results):
 
     query_words = set(tokenize(question))
+    candidates = []
 
-    best_sentence = passage
-    best_score = 0
+    for item in results:
 
-    for sentence in sentences:
+        passage_index = item["index"]
+        passage = knowledge_base[passage_index]
 
-        sentence_words = set(tokenize(sentence))
+        sentences = re.split(r"(?<=[.!?])\s+", passage)
 
-        matched = query_words & sentence_words
+        for sentence in sentences:
 
-        sentence_score = sum(
-            idf.get(word, 0)
-            for word in matched
-        )
+            sentence_words = set(tokenize(sentence))
+            matched = query_words & sentence_words
 
-        if sentence_score > best_score:
-            best_score = sentence_score
-            best_sentence = sentence
+            score = sum(
+                idf.get(word, 0)
+                for word in matched
+            )
 
-    return best_sentence
+            if len(matched) >= 2 and score > 0:
+                candidates.append((score, sentence))
+
+    candidates.sort(reverse=True)
+
+    selected = []
+
+    for score, sentence in candidates:
+
+        if sentence not in selected:
+
+            if not selected or score >= candidates[0][0] * 0.55:
+                selected.append(sentence)
+
+        if len(selected) == 3:
+            break
+
+    return " ".join(selected) if selected else None
 
 
 # -------------------------------
@@ -356,7 +418,16 @@ def query_endpoint(request: QueryRequest):
             "confidence": 0.2
         }
 
-    answer = extract_answer(question, best["index"])
+    answer = extract_answer(question, results)
+
+    if not answer:
+
+        return {
+            "answer": None,
+            "sources": [],
+            "scores": [],
+            "confidence": 0.2
+        }
 
     relevant = [
         item for item in results
