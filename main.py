@@ -143,7 +143,7 @@ def bm25_score(query_words, doc_words, doc_length):
 # RETRIEVAL
 # -------------------------------
 
-def retrieve(question, top_k=3):
+def retrieve(question, top_k=10):
 
     original_words = tokenize(question)
     query_words = expand_query(question)
@@ -207,6 +207,43 @@ def retrieve(question, top_k=3):
     )
 
     return results[:top_k]
+
+
+# -------------------------------
+# SOURCE FILTERING
+# -------------------------------
+
+def filter_sources(results):
+
+    if not results:
+        return []
+
+    best = results[0]
+
+    relevant = []
+
+    for item in results:
+
+        if item["index"] == best["index"]:
+            relevant.append(item)
+            continue
+
+        score_ratio = (
+            item["raw_score"] / max(best["raw_score"], 0.001)
+        )
+
+        minimum_coverage = max(
+            0.30,
+            best["coverage"] * 0.70
+        )
+
+        if (
+            item["coverage"] >= minimum_coverage
+            and score_ratio >= 0.55
+        ):
+            relevant.append(item)
+
+    return relevant
 
 
 # -------------------------------
@@ -318,20 +355,40 @@ def extract_answer(question, results):
             )
 
             if len(matched) >= 2 and score > 0:
-                candidates.append((score, sentence))
 
-    candidates.sort(reverse=True)
+                candidates.append({
+                    "score": score,
+                    "sentence": sentence,
+                    "source": passage_index
+                })
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    best_score = candidates[0]["score"]
 
     selected = []
+    seen = set()
 
-    for score, sentence in candidates:
+    for item in candidates:
 
-        if sentence not in selected:
+        sentence = item["sentence"]
 
-            if not selected or score >= candidates[0][0] * 0.55:
-                selected.append(sentence)
+        if sentence in seen:
+            continue
 
-        if len(selected) == 3:
+        if item["score"] < best_score * 0.75:
+            continue
+
+        selected.append(sentence)
+        seen.add(sentence)
+
+        if len(selected) == 2:
             break
 
     return " ".join(selected) if selected else None
@@ -382,7 +439,8 @@ def query_endpoint(request: QueryRequest):
 
     top_k = max(1, min(request.top_k, 10))
 
-    results = retrieve(question, top_k)
+    # Retrieve extra candidates before filtering
+    results = retrieve(question, 10)
 
     if not results:
 
@@ -404,9 +462,10 @@ def query_endpoint(request: QueryRequest):
             "confidence": 0.2
         }
 
+    # Check numeric evidence ONLY in the best passage
     candidate_passages = [
-    knowledge_base[best["index"]]
-]
+        knowledge_base[best["index"]]
+    ]
 
     if not has_numeric_evidence(question, candidate_passages):
 
@@ -417,7 +476,10 @@ def query_endpoint(request: QueryRequest):
             "confidence": 0.2
         }
 
-    answer = extract_answer(question, results)
+    # Filter irrelevant sources
+    relevant = filter_sources(results)[:top_k]
+
+    answer = extract_answer(question, relevant)
 
     if not answer:
 
@@ -427,11 +489,6 @@ def query_endpoint(request: QueryRequest):
             "scores": [],
             "confidence": 0.2
         }
-
-    relevant = [
-        item for item in results
-        if item["score"] >= 0.10
-    ]
 
     sources = [
         item["index"] for item in relevant
