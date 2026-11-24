@@ -46,16 +46,12 @@ with open(KB_PATH, "r", encoding="utf-8") as f:
 if not isinstance(knowledge_base, list) or len(knowledge_base) != 50:
     raise ValueError("Knowledge base must contain exactly 50 passages.")
 
-documents = [
-    text.lower() for text in knowledge_base
-]
+documents = [text.lower() for text in knowledge_base]
+
 
 def tokenize(text):
     words = re.findall(r"[a-z0-9]+", text.lower())
-    return [
-        word for word in words
-        if word not in STOPWORDS
-    ]
+    return [word for word in words if word not in STOPWORDS]
 
 
 tokenized_docs = [tokenize(doc) for doc in documents]
@@ -64,14 +60,12 @@ N = len(documents)
 doc_lengths = [len(doc) for doc in tokenized_docs]
 avg_length = sum(doc_lengths) / max(N, 1)
 
-# Document frequency
 df = {}
 
 for doc in tokenized_docs:
     for word in set(doc):
         df[word] = df.get(word, 0) + 1
 
-# Inverse document frequency
 idf = {
     word: math.log(
         1 + (N - frequency + 0.5) / (frequency + 0.5)
@@ -146,7 +140,6 @@ def retrieve(question, top_k=3):
             if total_weight > 0 else 0
         )
 
-        # Convert BM25 into a 0-1 relevance score
         normalized_score = 1 - math.exp(-raw_score / 2.5)
 
         results.append({
@@ -162,6 +155,91 @@ def retrieve(question, top_k=3):
     )
 
     return results[:top_k]
+
+
+# -------------------------------
+# QUESTION CLEANING
+# -------------------------------
+
+def sanitize_question(question):
+
+    question = re.sub(
+        r'(?i)\b(ignore|disregard|forget)\b[^.!?]*[.!?]',
+        ' ',
+        question
+    )
+
+    question = re.sub(
+        r'(?i)\b(reveal|show|print|dump|disclose)\b'
+        r'[^.!?]*?(?=\s+\band then\b|\s+\bthen\b|[.!?]|$)',
+        ' ',
+        question
+    )
+
+    question = re.sub(
+        r'(?i)\b(and then|then)\b',
+        ' ',
+        question
+    )
+
+    return re.sub(r'\s+', ' ', question).strip()
+
+
+# -------------------------------
+# ABSTENTION CHECK
+# -------------------------------
+
+def has_numeric_evidence(question, passages):
+
+    numeric_intent = re.search(
+        r'\b(exact|how many|how much|milliseconds|millisecond|'
+        r'seconds|minutes|numeric value|what number|'
+        r'configured value|in ms)\b',
+        question.lower()
+    )
+
+    if not numeric_intent:
+        return True
+
+    anchor_pattern = (
+        r'\b(timeout|timeouts|duration|durations|latency|'
+        r'interval|intervals|port|ports|quorum|quorums|'
+        r'batch|batches|window|windows|threshold|thresholds|'
+        r'heartbeat|heartbeats)\b'
+    )
+
+    anchors = re.findall(anchor_pattern, question.lower())
+
+    if not anchors:
+        return True
+
+    for passage in passages:
+
+        sentences = re.split(r'(?<=[.!?])\s+', passage)
+
+        for sentence in sentences:
+
+            words = re.findall(r'[a-z0-9]+', sentence.lower())
+
+            for anchor in anchors:
+
+                for i, word in enumerate(words):
+
+                    if word.rstrip("s") != anchor.rstrip("s"):
+                        continue
+
+                    start = max(0, i - 2)
+                    end = min(len(words), i + 3)
+
+                    nearby = words[start:end]
+
+                    if any(
+                        re.search(r'\d', w)
+                        for w in nearby
+                    ):
+                        return True
+
+    return False
 
 
 # -------------------------------
@@ -212,6 +290,7 @@ class QueryRequest(BaseModel):
 
 @app.get("/")
 def home():
+
     return {
         "status": "running",
         "message": "RAG Colosseum API is ready",
@@ -223,14 +302,15 @@ def home():
 # MAIN QUERY ENDPOINT
 # -------------------------------
 
-
 @app.post("/query")
 def query_endpoint(request: QueryRequest):
 
     original_question = request.question.strip()
+
     question = sanitize_question(original_question)
 
     if not question or not tokenize(question):
+
         return {
             "answer": None,
             "sources": [],
@@ -243,6 +323,7 @@ def query_endpoint(request: QueryRequest):
     results = retrieve(question, top_k)
 
     if not results:
+
         return {
             "answer": None,
             "sources": [],
@@ -253,6 +334,7 @@ def query_endpoint(request: QueryRequest):
     best = results[0]
 
     if best["coverage"] < 0.40 or best["raw_score"] < 0.50:
+
         return {
             "answer": None,
             "sources": [],
@@ -266,6 +348,7 @@ def query_endpoint(request: QueryRequest):
     ]
 
     if not has_numeric_evidence(question, candidate_passages):
+
         return {
             "answer": None,
             "sources": [],
@@ -280,8 +363,13 @@ def query_endpoint(request: QueryRequest):
         if item["score"] >= 0.10
     ]
 
-    sources = [item["index"] for item in relevant]
-    scores = [round(item["score"], 4) for item in relevant]
+    sources = [
+        item["index"] for item in relevant
+    ]
+
+    scores = [
+        round(item["score"], 4) for item in relevant
+    ]
 
     confidence = min(
         0.95,
@@ -296,61 +384,3 @@ def query_endpoint(request: QueryRequest):
         "scores": scores,
         "confidence": round(confidence, 4)
     }
-
-def sanitize_question(question):
-    # Remove malicious instruction clauses but retain valid questions.
-    question = re.sub(
-        r'(?i)\b(ignore|disregard|forget)\b[^.!?]*[.!?]',
-        ' ',
-        question
-    )
-
-    question = re.sub(
-        r'(?i)\b(reveal|show|print|dump|disclose)\b'
-        r'[^.!?]*?(?=\s+\band then\b|\s+\bthen\b|[.!?]|$)',
-        ' ',
-        question
-    )
-
-    question = re.sub(r'(?i)\b(and then|then)\b', ' ', question)
-    return re.sub(r'\s+', ' ', question).strip()
-
-
-def has_numeric_evidence(question, passages):
-    numeric_intent = re.search(
-        r'\b(exact|how many|how much|milliseconds|millisecond|'
-        r'seconds|minutes|numeric value|what number|'
-        r'configured value|in ms)\b',
-        question.lower()
-    )
-
-    if not numeric_intent:
-        return True
-
-    anchors = re.findall(
-        r'\b[a-z]*(?:timeout|duration|latency|interval|'
-        r'port|quorum|batch|window|threshold)\b',
-        question.lower()
-    )
-
-    if not anchors:
-        return True
-
-    for passage in passages:
-        sentences = re.split(r'(?<=[.!?])\s+', passage)
-
-        for sentence in sentences:
-            words = re.findall(r'[a-z0-9]+', sentence.lower())
-
-            for anchor in anchors:
-                for i, word in enumerate(words):
-                    if word.rstrip('s') == anchor.rstrip('s'):
-                        start = max(0, i - 4)
-                        end = min(len(words), i + 5)
-
-                        nearby = words[start:end]
-
-                        if any(re.search(r'\d', w) for w in nearby):
-                            return True
-
-    return False
